@@ -2,8 +2,10 @@ import os, json, tempfile, shutil, subprocess, uuid
 import boto3, requests
 import runpod
 
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
