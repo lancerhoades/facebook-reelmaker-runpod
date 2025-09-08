@@ -1,6 +1,6 @@
 runpod
 opencv-python-headless==4.10.0.84
 numpy
-moviepy
+moviepy==1.0.3
 boto3
 requests
