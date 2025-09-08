@@ -23,6 +23,27 @@ def _upload(path, bucket, key):
 def _presign(bucket, key, ttl=3600):
     return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl)
 
+
+# --- DEBUG_PROBE start ---
+import sys, subprocess
+def _pip_freeze():
+    try:
+        return subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+    except Exception as e:
+        return f"pip freeze failed: {e}"
+def _debug_report():
+    report = {"sys_version": sys.version, "sys_path": sys.path}
+    try:
+        import moviepy
+        report["moviepy_version"] = getattr(moviepy, "__version__", "unknown")
+        report["moviepy_import"] = "ok"
+    except Exception as e:
+        report["moviepy_import"] = f"failed: {e!r}"
+    report["pip_freeze"] = _pip_freeze().splitlines()
+    return report
+# --- DEBUG_PROBE end ---
+
+
 def handler(event):
     """
     Input:
@@ -34,6 +55,8 @@ def handler(event):
     }
     """
     data = event.get("input") or {}
+    if data.get("debug"):
+        return {"debug": _debug_report()}
     video_urls = data.get("video_urls") or []
     if not video_urls:
         single = data.get("video_url")
