@@ -17,6 +17,16 @@ if not AWS_S3_BUCKET:
 
 s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(s3={"addressing_style":"virtual"}))
 
+def _merge_event(event):
+    d = {}
+    if isinstance(event, dict):
+        inp = event.get("input")
+        if isinstance(inp, dict):
+            d.update(inp)
+        d.update({k:v for k,v in event.items() if k != "input"})
+    return d
+
+
 def _key(job_id: str, *parts: str) -> str:
     safe = [p.strip("/").replace("\\","/") for p in parts if p]
     return "/".join([S3_PREFIX_BASE.strip("/"), job_id] + safe)
@@ -55,9 +65,10 @@ def handler(event):
        }
     """
     log.info(f"event: {json.dumps(event)[:500]}")
-    job_id = event.get("job_id")
-    in_url = event.get("video_url") or event.get("input_url")
-    out_name = event.get("output_basename", "reel.mp4")
+    data = _merge_event(event)
+    job_id = data.get("job_id") or os.getenv("JOB_ID")
+    in_url = data.get("video_url") or data.get("input_url") or data.get("source_url") or data.get("video")
+    out_name = data.get("output_basename", "reel.mp4")
 
     if not job_id:
         return {"ok": False, "error": "job_id is required"}
