@@ -67,6 +67,16 @@ def _reelmaker_process(in_path: str, out_path: str):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     print(p.stdout or "", flush=True)
     if p.returncode != 0:
+
+    # Collect output from processed_videos/processed_*.mp4 and move to out_path
+    proc_dir = os.path.join(d, "processed_videos")
+    candidates = sorted(glob.glob(os.path.join(proc_dir, "processed_*.mp4")))
+    if not candidates:
+        listing = os.listdir(proc_dir) if os.path.isdir(proc_dir) else "<missing dir>"
+        raise RuntimeError(f"reelmaker produced no output in {proc_dir}. Contents: {listing}")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    shutil.move(candidates[0], out_path)
+
         raise RuntimeError(f"reelmaker failed (code {p.returncode})\n{p.stdout}")
 
 def handler(event):
