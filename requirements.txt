@@ -1,7 +1,7 @@
 runpod
 opencv-python-headless==4.10.0.84
 numpy==2.3.3
-moviepy==2.1.1
+moviepy>=1.0.3,<2.0
 boto3
 requests
 imageio-ffmpeg
