@@ -56,6 +56,20 @@ def _ffmpeg_reel(in_path: str, out_path: str):
     ]
     subprocess.check_call(cmd)
 
+
+def _reelmaker_process(in_path: str, out_path: str):
+    """Run reelmaker.py on the temp directory containing in.mp4 and move the first processed_* output to out_path."""
+    import pathlib, glob, shutil, sys, subprocess, os
+    d = os.path.dirname(in_path) or "."
+    # Execute reelmaker.py against the directory
+    subprocess.check_call([sys.executable, os.path.join(os.path.dirname(__file__), "reelmaker.py"), d])
+    # Collect output from processed_videos/processed_*.mp4
+    proc_dir = os.path.join(d, "processed_videos")
+    candidates = sorted(glob.glob(os.path.join(proc_dir, "processed_*.mp4")))
+    if not candidates:
+        raise RuntimeError("reelmaker produced no output")
+    shutil.move(candidates[0], out_path)
+
 def handler(event):
     """Input:
        {
@@ -84,8 +98,8 @@ def handler(event):
     _download(in_url, in_path)
 
     # 2) ffmpeg → portrait
-    log.info("Running ffmpeg (1080x1920)...")
-    _ffmpeg_reel(in_path, out_path)
+    log.info("Running reelmaker face-follow crop (1080x1920)...")
+    _reelmaker_process(in_path, out_path)
 
     # 3) Upload to S3
     key = _key(job_id, "reels", out_name)
