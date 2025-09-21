@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt force_rebuild.txt .
 RUN pip install -r requirements.txt
 
 # copy your model + config + scripts
