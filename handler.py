@@ -61,14 +61,14 @@ def _reelmaker_process(in_path: str, out_path: str):
     """Run reelmaker.py on the temp directory containing in.mp4 and move the first processed_* output to out_path."""
     import pathlib, glob, shutil, sys, subprocess, os
     d = os.path.dirname(in_path) or "."
-    # Execute reelmaker.py against the directory
-    # Run reelmaker and capture output (so RunPod shows the real error)
+    # Execute reelmaker.py and capture output so it shows up in RunPod logs
     cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "reelmaker.py"), d]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     print(p.stdout or "", flush=True)
     if p.returncode != 0:
+        raise RuntimeError(f"reelmaker failed (code {p.returncode})\n{p.stdout}")
 
-    # Collect output from processed_videos/processed_*.mp4 and move to out_path
+    # Collect output and move to out_path
     proc_dir = os.path.join(d, "processed_videos")
     candidates = sorted(glob.glob(os.path.join(proc_dir, "processed_*.mp4")))
     if not candidates:
@@ -76,9 +76,6 @@ def _reelmaker_process(in_path: str, out_path: str):
         raise RuntimeError(f"reelmaker produced no output in {proc_dir}. Contents: {listing}")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     shutil.move(candidates[0], out_path)
-
-        raise RuntimeError(f"reelmaker failed (code {p.returncode})\n{p.stdout}")
-
 def handler(event):
     """Input:
        {
