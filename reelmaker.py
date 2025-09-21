@@ -2,6 +2,13 @@ import cv2
 import numpy as np
 import moviepy.editor as mpy
 import sys
+import importlib
+print(f"[reelmaker] numpy={np.__version__}", flush=True)
+try:
+    import moviepy, imageio, imageio_ffmpeg
+    print(f"[reelmaker] moviepy={moviepy.__version__} imageio={imageio.__version__}", flush=True)
+except Exception as e:
+    print(f"[reelmaker] import check failed: {e}", flush=True)
 import os
 
 # --- Change 1: Dynamic BASE_DIR to the script's directory ---
