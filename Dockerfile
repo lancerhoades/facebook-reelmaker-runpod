@@ -1,11 +1,9 @@
 FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 
-    PIP_NO_CACHE_DIR=1 
-    PIP_PREFER_BINARY=1 
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_PREFER_BINARY=1 \
     PIP_ONLY_BINARY="numpy,opencv-python-headless"
-
-    PIP_NO_CACHE_DIR=1
 
 # ffmpeg needed by moviepy, and libgl/libglib for OpenCV headless
 RUN apt-get update && apt-get install -y --no-install-recommends \
