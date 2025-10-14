@@ -1,125 +1,212 @@
-import os, json, subprocess, tempfile, logging
-import boto3
-from botocore.client import Config
+import os, io, sys, json, tempfile, traceback, subprocess, shutil, time
+from urllib.parse import urlparse
 import requests
-import runpod
 
-LOG_LEVEL = os.getenv("LOG_LEVEL","INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-log = logging.getLogger("reelmaker")
+# wire up Slack
+SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
 
-AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
-AWS_S3_BUCKET  = os.getenv("AWS_S3_BUCKET")
-S3_PREFIX_BASE = os.getenv("S3_PREFIX_BASE", "jobs")
+def post_to_slack(msg: str, webhook_override: str|None=None):
+    url = (webhook_override or SLACK_WEBHOOK_ENV or "").strip()
+    if not url:
+        return
+    try:
+        requests.post(url, json={"text": msg}, timeout=5)
+    except Exception:
+        pass
 
-if not AWS_S3_BUCKET:
-    raise RuntimeError("AWS_S3_BUCKET must be set in the environment for S3-only operation.")
+def human_bytes(n: int|None) -> str:
+    if not n: return "0 B"
+    units = ["B","KB","MB","GB","TB"]
+    i = 0
+    x = float(n)
+    while x >= 1024 and i < len(units)-1:
+        x /= 1024.0; i += 1
+    return f"{x:.2f} {units[i]}"
 
-s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(s3={"addressing_style":"virtual"}))
-
-def _merge_event(event):
-    d = {}
-    if isinstance(event, dict):
-        inp = event.get("input")
-        if isinstance(inp, dict):
-            d.update(inp)
-        d.update({k:v for k,v in event.items() if k != "input"})
-    return d
-
-
-def _key(job_id: str, *parts: str) -> str:
-    safe = [p.strip("/").replace("\\","/") for p in parts if p]
-    return "/".join([S3_PREFIX_BASE.strip("/"), job_id] + safe)
-
-def _presign(key: str, expires=604800) -> str:
-    return s3.generate_presigned_url("get_object", Params={"Bucket": AWS_S3_BUCKET, "Key": key}, ExpiresIn=expires)
-
-def _download(url: str, dest: str):
-    with requests.get(url, stream=True, timeout=1800) as r:
+def http_get_to(path: str, url: str, slack=None):
+    with requests.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1<<20):
+        size = int(r.headers.get("Content-Length") or 0)
+        ctype = r.headers.get("Content-Type") or "?"
+        print(f"[FETCH] {url} -> {path} ({human_bytes(size)}; {ctype})", flush=True)
+        if slack:
+            post_to_slack(f"[reelmaker] downloading input… size={human_bytes(size)} type={ctype}", slack)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024*1024):
                 if chunk:
                     f.write(chunk)
 
-def _ffmpeg_reel(in_path: str, out_path: str):
-    # Portrait 1080x1920: scale to fit, pad to 1080x1920
-    vf = "scale=1080:-2:force_original_aspect_ratio=decrease,pad=1080:1920:(1080-iw)/2:(1920-ih)/2"
-    cmd = [
-        "ffmpeg","-hide_banner","-y","-i", in_path,
-        "-vf", vf,
-        "-c:v","libx264","-preset","fast","-crf","18","-pix_fmt","yuv420p",
-        "-c:a","aac","-b:a","160k",
-        "-movflags","+faststart",
-        out_path
-    ]
-    subprocess.check_call(cmd)
+def sh(cmd: list[str]) -> tuple[int,str]:
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return (0, out.strip())
+    except subprocess.CalledProcessError as e:
+        return (e.returncode, e.output.strip())
 
+def ffprobe_summary(path: str) -> str:
+    code, out = sh(["ffprobe","-hide_banner","-v","error",
+                    "-show_entries","format=duration:stream=index,codec_type,codec_name,avg_frame_rate,width,height",
+                    "-of","json", path])
+    if code == 0:
+        return out
+    return f"(ffprobe failed)\n{out}"
 
-def _reelmaker_process(in_path: str, out_path: str):
-    """Run reelmaker.py on the temp directory containing in.mp4 and move the first processed_* output to out_path."""
-    import pathlib, glob, shutil, sys, subprocess, os
-    d = os.path.dirname(in_path) or "."
-    # Execute reelmaker.py and capture output so it shows up in RunPod logs
-    cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "reelmaker.py"), d]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    print(p.stdout or "", flush=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"reelmaker failed (code {p.returncode})\n{p.stdout}")
+def ffmpeg_null_mux(path: str) -> str:
+    # Surface decode/packetization errors without writing output
+    code, out = sh(["ffmpeg","-hide_banner","-v","error","-i", path, "-f","null","-"])
+    if code == 0 and not out:
+        return "(ffmpeg null mux OK; no errors)"
+    return out or "(no output from ffmpeg)"
 
-    # Collect output and move to out_path
-    proc_dir = os.path.join(d, "processed_videos")
-    candidates = sorted(glob.glob(os.path.join(proc_dir, "processed_*.mp4")))
-    if not candidates:
-        listing = os.listdir(proc_dir) if os.path.isdir(proc_dir) else "<missing dir>"
-        raise RuntimeError(f"reelmaker produced no output in {proc_dir}. Contents: {listing}")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    shutil.move(candidates[0], out_path)
+def list_tree(root: str) -> str:
+    buf = io.StringIO()
+    for base, dirs, files in os.walk(root):
+        rel = os.path.relpath(base, root)
+        buf.write(f"./{rel}\n")
+        for name in files:
+            p = os.path.join(base, name)
+            try:
+                sz = os.path.getsize(p)
+            except Exception:
+                sz = -1
+            buf.write(f"  {name}  ({human_bytes(sz)})\n")
+    return buf.getvalue()
+
+# ---- import reelmaker core ----
+import reelmaker as rm
+
+def _reelmaker_process(in_path: str, out_dir: str, slack=None):
+    # reelmaker.py expects a folder of mp4s and writes to processed_videos/
+    work_dir = tempfile.mkdtemp(prefix="reel_")
+    inp_dir = work_dir
+    proc_dir = os.path.join(work_dir, "processed_videos")
+    os.makedirs(proc_dir, exist_ok=True)
+    # place the single input file into the folder
+    base = os.path.basename(in_path)
+    local_in = os.path.join(inp_dir, base)
+    shutil.copyfile(in_path, local_in)
+
+    print(f"[reelmaker] analyze+process start… work={work_dir}", flush=True)
+    post_to_slack(f"[reelmaker] face-follow crop (1080x1920)…", slack)
+
+    try:
+        # Call main pipeline on the folder
+        # (re-implement minimal portion of reelmaker.main() for one file)
+        face_pos, motion_pos, fps, frame_dims = rm.analyze_video(local_in)
+        crop_rects = rm.compute_crop_positions(face_pos, motion_pos, frame_dims, fps)
+
+        import moviepy.editor as mpy
+        clip = mpy.VideoFileClip(local_in)
+
+        def process_frame(get_frame, t):
+            frame_idx = int(t * fps)
+            if frame_idx >= len(crop_rects):
+                frame_idx = len(crop_rects) - 1
+            x1, y1, w, h = crop_rects[frame_idx]
+            frame = get_frame(t)
+            import cv2
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cropped = bgr[y1:y1+h, x1:x1+w]
+            resized = cv2.resize(cropped, (rm.DESIRED_WIDTH, rm.DESIRED_HEIGHT), interpolation=cv2.INTER_AREA)
+            return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+        processed = clip.fl(process_frame)
+
+        out_file = os.path.join(proc_dir, f"processed_{base}")
+        processed.write_videofile(
+            out_file,
+            codec="libx264",
+            audio_codec="aac",
+            temp_audiofile=os.path.join(work_dir, "temp-audio.m4a"),
+            remove_temp=True,
+            verbose=False,
+            logger=None
+        )
+    except Exception as e:
+        # bubble up; outer handler will Slack the diagnostics
+        raise
+    finally:
+        # always show what we ended up with
+        listing = list_tree(work_dir)
+        print(f"[reelmaker] work dir listing:\n{listing}", flush=True)
+
+    # Return the output (if any)
+    outs = [f for f in os.listdir(proc_dir) if f.lower().endswith(".mp4")]
+    return work_dir, proc_dir, sorted(outs)
+
 def handler(event):
-    """Input:
-       {
-         "job_id": "20250920-...-abc123",
-         "video_url": "https://presigned-or-public-url.mp4",
-         "output_basename": "reel.mp4"   # optional
-       }
-    """
-    log.info(f"event: {json.dumps(event)[:500]}")
-    data = _merge_event(event)
-    job_id = data.get("job_id") or os.getenv("JOB_ID")
-    in_url = data.get("video_url") or data.get("input_url") or data.get("source_url") or data.get("video")
-    out_name = data.get("output_basename", "reel.mp4")
+    inp = (event or {}).get("input") or {}
+    job_id = inp.get("job_id") or "noid"
+    video_url = inp.get("video_url") or inp.get("mp4_url") or inp.get("url")
+    output_basename = inp.get("output_basename") or "output.mp4"
+    slack = inp.get("slack_webhook") or None
 
-    if not job_id:
-        return {"ok": False, "error": "job_id is required"}
-    if not in_url or not str(in_url).startswith("http"):
-        return {"ok": False, "error": "video_url (http/https) is required"}
+    if not video_url or not str(video_url).startswith("http"):
+        msg = f"missing/invalid video_url: {video_url}"
+        post_to_slack(f":x: [reelmaker] {job_id} {msg}", slack)
+        return {"error": msg}
 
-    tdir = tempfile.mkdtemp(prefix="reel_")
-    in_path  = os.path.join(tdir, "in.mp4")
-    out_path = os.path.join(tdir, out_name)
+    with tempfile.TemporaryDirectory(prefix="reel_dl_") as td:
+        in_path = os.path.join(td, "input.mp4")
+        try:
+            http_get_to(in_path, video_url, slack)
+        except Exception as e:
+            post_to_slack(f":x: [reelmaker] {job_id} download failed: {e}", slack)
+            return {"error": "download_failed", "details": str(e)}
 
-    # 1) Download input
-    log.info("Downloading input video...")
-    _download(in_url, in_path)
+        # preflight diagnostics
+        probe = ffprobe_summary(in_path)
+        nullmux = ffmpeg_null_mux(in_path)
+        print(f"[diag] ffprobe:\n{probe}\n", flush=True)
+        print(f"[diag] ffmpeg null mux:\n{nullmux}\n", flush=True)
 
-    # 2) ffmpeg → portrait
-    log.info("Running reelmaker face-follow crop (1080x1920)...")
-    _reelmaker_process(in_path, out_path)
+        try:
+            work_dir, proc_dir, outs = _reelmaker_process(in_path, td, slack)
+        except Exception as e:
+            tb = traceback.format_exc(limit=8)
+            listing = list_tree(work_dir) if 'work_dir' in locals() else "(no work_dir)"
+            post_to_slack(
+                f":x: [reelmaker] {job_id} processing error\n"
+                f"input: {os.path.basename(in_path)}\n"
+                f"ffprobe: ```{probe[:3500]}```\n"
+                f"ffmpeg null: ```{nullmux[:3500]}```\n"
+                f"traceback: ```{tb[:3500]}```\n"
+                f"work tree:\n```{listing[:3500]}```",
+                slack
+            )
+            return {"error": "processing_failed", "details": str(e)}
 
-    # 3) Upload to S3
-    key = _key(job_id, "reels", out_name)
-    log.info(f"Uploading to s3://{AWS_S3_BUCKET}/{key}")
-    s3.upload_file(out_path, AWS_S3_BUCKET, key)
+        if not outs:
+            listing = list_tree(work_dir)
+            post_to_slack(
+                f":x: [reelmaker] {job_id} produced no output.\n"
+                f"ffprobe: ```{probe[:3500]}```\n"
+                f"ffmpeg null: ```{nullmux[:3500]}```\n"
+                f"work tree:\n```{listing[:3500]}```",
+                slack
+            )
+            raise RuntimeError(f"reelmaker produced no output in {proc_dir}. Contents: []")
 
-    # 4) Return keys + presigned URL
-    url = _presign(key)
-    return {
-        "ok": True,
-        "keys": {"reel_key": key},
-        "s3":   {"reel": f"s3://{AWS_S3_BUCKET}/{key}"},
-        "urls": {"reel_url": url},
-    }
+        # success path: put file where the caller expects it (return name + temp path info)
+        produced = os.path.join(proc_dir, outs[0])
+        final_out = os.path.join(td, output_basename)
+        shutil.copyfile(produced, final_out)
 
-if __name__ == "__main__":
+        post_to_slack(f"[reelmaker] {job_id} OK → {output_basename}", slack)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "output_path": final_out,
+            "produced": outs,
+            "probe": probe[:1000]
+        }
+
+# runpod glue
+try:
+    import runpod
     runpod.serverless.start({"handler": handler})
+except Exception as _:
+    # allow local run for debugging without runpod
+    if __name__ == "__main__":
+        print("Runpod not available; this file is meant to be used in serverless mode.")
