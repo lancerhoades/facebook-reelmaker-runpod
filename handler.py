@@ -1,11 +1,11 @@
-import os, io, sys, json, tempfile, traceback, subprocess, shutil, time
+import os, io, sys, json, tempfile, traceback, subprocess, shutil, time, boto3
 from urllib.parse import urlparse
 import requests
 
 # wire up Slack
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
 
-def post_to_slack(msg: str, webhook_override: str|None=None):
+def post_to_slack(msg: str, webhook_override: str | None = None):
     url = (webhook_override or SLACK_WEBHOOK_ENV or "").strip()
     if not url:
         return
@@ -14,13 +14,15 @@ def post_to_slack(msg: str, webhook_override: str|None=None):
     except Exception:
         pass
 
-def human_bytes(n: int|None) -> str:
-    if not n: return "0 B"
-    units = ["B","KB","MB","GB","TB"]
+def human_bytes(n: int | None) -> str:
+    if not n:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
     i = 0
     x = float(n)
-    while x >= 1024 and i < len(units)-1:
-        x /= 1024.0; i += 1
+    while x >= 1024 and i < len(units) - 1:
+        x /= 1024.0
+        i += 1
     return f"{x:.2f} {units[i]}"
 
 def http_get_to(path: str, url: str, slack=None):
@@ -33,11 +35,11 @@ def http_get_to(path: str, url: str, slack=None):
             post_to_slack(f"[reelmaker] downloading input… size={human_bytes(size)} type={ctype}", slack)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
-            for chunk in r.iter_content(1024*1024):
+            for chunk in r.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
 
-def sh(cmd: list[str]) -> tuple[int,str]:
+def sh(cmd: list[str]) -> tuple[int, str]:
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
         return (0, out.strip())
@@ -45,16 +47,18 @@ def sh(cmd: list[str]) -> tuple[int,str]:
         return (e.returncode, e.output.strip())
 
 def ffprobe_summary(path: str) -> str:
-    code, out = sh(["ffprobe","-hide_banner","-v","error",
-                    "-show_entries","format=duration:stream=index,codec_type,codec_name,avg_frame_rate,width,height",
-                    "-of","json", path])
+    code, out = sh([
+        "ffprobe", "-hide_banner", "-v", "error",
+        "-show_entries", "format=duration:stream=index,codec_type,codec_name,avg_frame_rate,width,height",
+        "-of", "json", path
+    ])
     if code == 0:
         return out
     return f"(ffprobe failed)\n{out}"
 
 def ffmpeg_null_mux(path: str) -> str:
     # Surface decode/packetization errors without writing output
-    code, out = sh(["ffmpeg","-hide_banner","-v","error","-i", path, "-f","null","-"])
+    code, out = sh(["ffmpeg", "-hide_banner", "-v", "error", "-i", path, "-f", "null", "-"])
     if code == 0 and not out:
         return "(ffmpeg null mux OK; no errors)"
     return out or "(no output from ffmpeg)"
@@ -72,6 +76,20 @@ def list_tree(root: str) -> str:
                 sz = -1
             buf.write(f"  {name}  ({human_bytes(sz)})\n")
     return buf.getvalue()
+
+# -------- S3 helpers --------
+def s3_client(region: str | None = None):
+    region = region or os.environ.get("AWS_REGION") or "us-east-1"
+    return boto3.client("s3", region_name=region)
+
+def s3_upload_file(bucket: str, key: str, local_path: str, region: str | None = None):
+    c = s3_client(region)
+    c.upload_file(local_path, bucket, key)
+    return f"s3://{bucket}/{key}"
+
+def s3_presign_get(bucket: str, key: str, region: str | None = None, expires: int = 604800):
+    c = s3_client(region)
+    return c.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
 
 # ---- import reelmaker core ----
 import reelmaker as rm
@@ -92,7 +110,6 @@ def _reelmaker_process(in_path: str, out_dir: str, slack=None):
 
     try:
         # Call main pipeline on the folder
-        # (re-implement minimal portion of reelmaker.main() for one file)
         face_pos, motion_pos, fps, frame_dims = rm.analyze_video(local_in)
         crop_rects = rm.compute_crop_positions(face_pos, motion_pos, frame_dims, fps)
 
@@ -123,7 +140,7 @@ def _reelmaker_process(in_path: str, out_dir: str, slack=None):
             verbose=False,
             logger=None
         )
-    except Exception as e:
+    except Exception:
         # bubble up; outer handler will Slack the diagnostics
         raise
     finally:
@@ -133,6 +150,7 @@ def _reelmaker_process(in_path: str, out_dir: str, slack=None):
 
     # Return the output (if any)
     outs = [f for f in os.listdir(proc_dir) if f.lower().endswith(".mp4")]
+    post_to_slack(f"[reelmaker] found outputs: {outs}", slack)
     return work_dir, proc_dir, sorted(outs)
 
 def handler(event):
@@ -141,6 +159,12 @@ def handler(event):
     video_url = inp.get("video_url") or inp.get("mp4_url") or inp.get("url")
     output_basename = inp.get("output_basename") or "output.mp4"
     slack = inp.get("slack_webhook") or None
+
+    # S3 config (can be passed in, or taken from env)
+    s3_cfg = inp.get("s3") or {}
+    s3_bucket = (s3_cfg.get("bucket") or os.environ.get("AWS_S3_BUCKET") or "").strip()
+    s3_region = (s3_cfg.get("region") or os.environ.get("AWS_REGION") or "us-east-1").strip()
+    s3_key = (s3_cfg.get("key") or f"jobs/{job_id}/reels/{output_basename}").strip()
 
     if not video_url or not str(video_url).startswith("http"):
         msg = f"missing/invalid video_url: {video_url}"
@@ -193,20 +217,35 @@ def handler(event):
         final_out = os.path.join(td, output_basename)
         shutil.copyfile(produced, final_out)
 
+        # Upload to S3 if configured
+        s3_uri = None
+        s3_url = None
+        if s3_bucket:
+            try:
+                s3_uri = s3_upload_file(s3_bucket, s3_key, final_out, s3_region)
+                s3_url = s3_presign_get(s3_bucket, s3_key, s3_region)
+                post_to_slack(f"[reelmaker] {job_id} uploaded → {s3_uri}", slack)
+            except Exception as e:
+                post_to_slack(f":x: [reelmaker] {job_id} S3 upload failed: {e}", slack)
+
         post_to_slack(f"[reelmaker] {job_id} OK → {output_basename}", slack)
         return {
             "ok": True,
             "job_id": job_id,
             "output_path": final_out,
             "produced": outs,
-            "probe": probe[:1000]
+            "probe": probe[:1000],
+            "s3_bucket": s3_bucket,
+            "s3_key": s3_key,
+            "s3_uri": s3_uri,
+            "s3_url": s3_url
         }
 
 # runpod glue
 try:
     import runpod
     runpod.serverless.start({"handler": handler})
-except Exception as _:
+except Exception:
     # allow local run for debugging without runpod
     if __name__ == "__main__":
         print("Runpod not available; this file is meant to be used in serverless mode.")
