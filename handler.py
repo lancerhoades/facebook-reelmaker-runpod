@@ -91,6 +91,25 @@ def s3_presign_get(bucket: str, key: str, region: str | None = None, expires: in
     c = s3_client(region)
     return c.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
 
+def s3_head(bucket: str, key: str, region: str | None = None) -> dict | None:
+    try:
+        c = s3_client(region)
+        return c.head_object(Bucket=bucket, Key=key)
+    except Exception:
+        return None
+
+def s3_download_to(bucket: str, key: str, local_path: str, region: str | None = None, slack=None):
+    c = s3_client(region)
+    meta = c.head_object(Bucket=bucket, Key=key)
+    size = int(meta.get("ContentLength", 0))
+    ctype = (meta.get("ContentType") or "?")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    c.download_file(bucket, key, local_path)
+    print(f"[S3 FETCH] s3://{bucket}/{key} -> {local_path} ({human_bytes(size)}; {ctype})", flush=True)
+    if slack:
+        post_to_slack(f"[reelmaker] downloading input from S3… size={human_bytes(size)} type={ctype}", slack)
+    return size, ctype
+
 # ---- import reelmaker core ----
 import reelmaker as rm
 
@@ -153,37 +172,98 @@ def _reelmaker_process(in_path: str, out_dir: str, slack=None):
     post_to_slack(f"[reelmaker] found outputs: {outs}", slack)
     return work_dir, proc_dir, sorted(outs)
 
+def _valid_media_ffprobe_json(ffprobe_json: str) -> bool:
+    try:
+        obj = json.loads(ffprobe_json or "{}")
+        fmt = obj.get("format") or {}
+        streams = obj.get("streams") or []
+        # duration must be present and parsable; at least one stream
+        dur = float(fmt.get("duration", "nan"))
+        return (not (dur != dur)) and (dur > 0) and (len(streams) > 0)  # NaN check
+    except Exception:
+        return False
+
 def handler(event):
     inp = (event or {}).get("input") or {}
     job_id = inp.get("job_id") or "noid"
+
+    # Preferred S3 path
+    bucket = (inp.get("bucket") or (inp.get("s3") or {}).get("bucket") or os.environ.get("AWS_S3_BUCKET") or "").strip()
+    video_key = (inp.get("video_key") or (inp.get("s3") or {}).get("video_key") or "").strip()
+
+    # Fallback URL path
     video_url = inp.get("video_url") or inp.get("mp4_url") or inp.get("url")
+
     output_basename = inp.get("output_basename") or "output.mp4"
     slack = inp.get("slack_webhook") or None
 
-    # S3 config (can be passed in, or taken from env)
+    # S3 output config (keep your previous semantics)
     s3_cfg = inp.get("s3") or {}
     s3_bucket = (s3_cfg.get("bucket") or os.environ.get("AWS_S3_BUCKET") or "").strip()
     s3_region = (s3_cfg.get("region") or os.environ.get("AWS_REGION") or "us-east-1").strip()
     s3_key = (s3_cfg.get("key") or f"jobs/{job_id}/reels/{output_basename}").strip()
 
-    if not video_url or not str(video_url).startswith("http"):
-        msg = f"missing/invalid video_url: {video_url}"
-        post_to_slack(f":x: [reelmaker] {job_id} {msg}", slack)
-        return {"error": msg}
-
     with tempfile.TemporaryDirectory(prefix="reel_dl_") as td:
         in_path = os.path.join(td, "input.mp4")
+
+        # --- Download preference: S3 key -> URL
+        size_bytes = 0
         try:
-            http_get_to(in_path, video_url, slack)
+            if bucket and video_key:
+                head = s3_head(bucket, video_key, s3_region)
+                if not head:
+                    msg = f"cannot head_object s3://{bucket}/{video_key}"
+                    post_to_slack(f":x: [reelmaker] {job_id} {msg}", slack)
+                    return {"error": "s3_head_failed", "details": msg}
+                size_bytes = int(head.get("ContentLength", 0))
+                if size_bytes < 50 * 1024:
+                    msg = f"S3 object too small ({size_bytes} B) s3://{bucket}/{video_key}"
+                    post_to_slack(f":x: [reelmaker] {job_id} {msg}", slack)
+                    return {"error": "tiny_source", "details": msg}
+
+                s3_download_to(bucket, video_key, in_path, s3_region, slack=slack)
+
+            elif video_url and str(video_url).startswith("http"):
+                # optional: quick HEAD to guard 261 B bogus files
+                try:
+                    r = requests.head(video_url, timeout=20, allow_redirects=True)
+                    clen = int(r.headers.get("Content-Length") or 0)
+                    if clen and clen < 50 * 1024:
+                        msg = f"remote object too small via URL ({clen} B)"
+                        post_to_slack(f":x: [reelmaker] {job_id} {msg}", slack)
+                        return {"error": "tiny_source_url", "details": msg}
+                except Exception:
+                    # ignore HEAD errors; GET will raise if truly bad
+                    pass
+
+                http_get_to(in_path, video_url, slack)
+                size_bytes = os.path.getsize(in_path)
+                if size_bytes < 50 * 1024:
+                    msg = f"downloaded file too small ({size_bytes} B) from URL"
+                    post_to_slack(f":x: [reelmaker] {job_id} {msg}", slack)
+                    return {"error": "tiny_download", "details": msg}
+            else:
+                msg = f"missing input (need bucket+video_key or video_url)"
+                post_to_slack(f":x: [reelmaker] {job_id} {msg}", slack)
+                return {"error": "missing_input", "details": msg}
         except Exception as e:
             post_to_slack(f":x: [reelmaker] {job_id} download failed: {e}", slack)
             return {"error": "download_failed", "details": str(e)}
 
-        # preflight diagnostics
+        # --- preflight diagnostics
         probe = ffprobe_summary(in_path)
         nullmux = ffmpeg_null_mux(in_path)
         print(f"[diag] ffprobe:\n{probe}\n", flush=True)
         print(f"[diag] ffmpeg null mux:\n{nullmux}\n", flush=True)
+
+        # fail fast if ffprobe says no streams/duration
+        if not _valid_media_ffprobe_json(probe):
+            post_to_slack(
+                f":x: [reelmaker] {job_id} invalid media after download "
+                f"({human_bytes(size_bytes)}). See ffprobe/null below.",
+                slack
+            )
+            return {"error": "invalid_media", "details": "ffprobe shows no streams/duration", "probe": probe[:1000]}
 
         try:
             work_dir, proc_dir, outs = _reelmaker_process(in_path, td, slack)
