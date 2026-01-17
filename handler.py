@@ -4,8 +4,15 @@ import requests
 
 # wire up Slack
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
+SLACK_VERBOSE = os.environ.get("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
+
+def _slack_is_important(message: str) -> bool:
+    msg = (message or "").lower()
+    return any(tok in msg for tok in (":x:", ":warning:", "[error]", "error:", "failed"))
 
 def post_to_slack(msg: str, webhook_override: str | None = None):
+    if not (SLACK_VERBOSE or _slack_is_important(msg)):
+        return
     url = (webhook_override or SLACK_WEBHOOK_ENV or "").strip()
     if not url:
         return
@@ -320,6 +327,7 @@ def handler(event):
             "s3_uri": s3_uri,
             "s3_url": s3_url
         }
+
 
 # runpod glue
 try:
