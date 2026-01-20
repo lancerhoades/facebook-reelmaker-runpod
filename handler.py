@@ -6,6 +6,7 @@ import requests
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
 SLACK_VERBOSE = os.environ.get("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
 POD_NAME = os.environ.get("POD_NAME", "facebook-reelmaker-runpod")
+_CURRENT_JOB_ID = None
 
 def _slack_is_important(message: str) -> bool:
     msg = (message or "").lower()
@@ -18,7 +19,11 @@ def post_to_slack(msg: str, webhook_override: str | None = None):
     if not url:
         return
     try:
-        out = f"[{POD_NAME}] {msg}"
+        job_id = _CURRENT_JOB_ID
+        prefix = f"[{POD_NAME}]"
+        if job_id:
+            prefix += f" [{job_id}]"
+        out = f"{prefix} {msg}"
         requests.post(url, json={"text": out}, timeout=5)
     except Exception:
         pass
@@ -195,6 +200,8 @@ def _valid_media_ffprobe_json(ffprobe_json: str) -> bool:
 def handler(event):
     inp = (event or {}).get("input") or {}
     job_id = inp.get("job_id") or "noid"
+    global _CURRENT_JOB_ID
+    _CURRENT_JOB_ID = job_id
 
     # Preferred S3 path
     bucket = (inp.get("bucket") or (inp.get("s3") or {}).get("bucket") or os.environ.get("AWS_S3_BUCKET") or "").strip()
