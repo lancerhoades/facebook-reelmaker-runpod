@@ -5,6 +5,7 @@ import requests
 # wire up Slack
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
 SLACK_VERBOSE = os.environ.get("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
+POD_NAME = os.environ.get("POD_NAME", "facebook-reelmaker-runpod")
 
 def _slack_is_important(message: str) -> bool:
     msg = (message or "").lower()
@@ -17,7 +18,8 @@ def post_to_slack(msg: str, webhook_override: str | None = None):
     if not url:
         return
     try:
-        requests.post(url, json={"text": msg}, timeout=5)
+        out = f"[{POD_NAME}] {msg}"
+        requests.post(url, json={"text": out}, timeout=5)
     except Exception:
         pass
 
